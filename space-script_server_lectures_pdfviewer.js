@@ -4269,18 +4269,73 @@ function parseDirectoryListingForPdfs(html, baseUrl) {
 }
 
 async function ensurePdfJsLoaded() {
+    // لو موجودة بالفعل
     if (window.pdfjsLib && window.pdfjsLib.getDocument) return;
 
-    // PDF.js stable (محدد Version عشان مايتكسرش)
-    const ver = '5.4.449'; // stable around late 2025
-    const scriptUrl = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/build/pdf.min.js`;
-    const workerUrl = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/build/pdf.worker.min.js`;
+    // ملاحظة: في إصدارات PDF.js الحديثة، ملف build/ ممكن يكون ESM ومايطلعش pdfjsLib كـ global.
+    // لذلك بنجرب legacy/build أولاً (مناسب للـ CDN) ثم fallback.
+    const ver = '5.4.530'; // stable (late 2025)
 
-    await loadScriptOnce(scriptUrl, 'pdfjsLibScript');
+    const candidates = [
+        {
+            lib: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/legacy/build/pdf.min.js`,
+            worker: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/legacy/build/pdf.worker.min.js`,
+        },
+        // fallback قديم جاهز كـ UMD globals
+        {
+            lib: `https://cdn.jsdelivr.net/npm/pdfjs-dist-legacy/pdf.min.js`,
+            worker: `https://cdn.jsdelivr.net/npm/pdfjs-dist-legacy/pdf.worker.min.js`,
+        },
+    ];
 
-    if (window.pdfjsLib) {
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+    let lastErr = null;
+
+    // نظّف أي بقايا سابقة
+    try {
+        const old = document.getElementById('pdfjsLibScript');
+        if (old && !old.__keep) old.remove();
+    } catch (e) {}
+
+    for (const c of candidates) {
+        try {
+            // حمّل المكتبة
+            await loadScriptOnce(c.lib, 'pdfjsLibScript');
+
+            // بعض الـ builds بتطلعها في أماكن مختلفة
+            window.pdfjsLib =
+                window.pdfjsLib ||
+                window['pdfjs-dist/build/pdf'] ||
+                (window.exports && window.exports['pdfjs-dist/build/pdf']) ||
+                (window.exports && window.exports.pdfjsLib);
+
+            if (window.pdfjsLib && window.pdfjsLib.getDocument) {
+                // worker
+                try {
+                    window.pdfjsLib.GlobalWorkerOptions.workerSrc = c.worker;
+                } catch (e) {}
+                // علِّم السكربت إنه ناجح
+                const s = document.getElementById('pdfjsLibScript');
+                if (s) s.__keep = true;
+                return;
+            }
+
+            // لو اتحمل لكن مافيش global، جرّب اللي بعده
+            lastErr = new Error('PDF.js loaded but pdfjsLib global not found');
+            const s = document.getElementById('pdfjsLibScript');
+            if (s && !s.__keep) s.remove();
+            // امسح أي references
+            try { delete window.pdfjsLib; } catch (e) {}
+        } catch (e) {
+            lastErr = e;
+            try {
+                const s = document.getElementById('pdfjsLibScript');
+                if (s && !s.__keep) s.remove();
+            } catch (ee) {}
+            try { delete window.pdfjsLib; } catch (ee) {}
+        }
     }
+
+    throw lastErr || new Error('Unable to load PDF.js');
 }
 
 function loadScriptOnce(src, id) {
@@ -4296,9 +4351,82 @@ function loadScriptOnce(src, id) {
     });
 }
 
+
+function setPdfControlsEnabled(enabled) {
+    const ids = ['prevPdfPageBtn', 'nextPdfPageBtn', 'zoomInBtn', 'zoomOutBtn'];
+    for (const id of ids) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.disabled = !enabled;
+        el.classList.toggle('disabled', !enabled);
+    }
+    const indicator = document.querySelector('.viewer-page-indicator');
+    if (indicator) indicator.style.opacity = enabled ? '1' : '0.6';
+}
+
+function ensurePdfIframe() {
+    const wrap = document.getElementById('pdfCanvasWrap');
+    if (!wrap) return null;
+    let iframe = document.getElementById('pdfIframe');
+    if (!iframe) {
+        iframe = document.createElement('iframe');
+        iframe.id = 'pdfIframe';
+        iframe.title = 'PDF Viewer';
+        iframe.loading = 'lazy';
+        iframe.style.width = '100%';
+        iframe.style.height = '100%';
+        iframe.style.border = '0';
+        iframe.style.display = 'none';
+        wrap.appendChild(iframe);
+    }
+    return iframe;
+}
+
+function fallbackOpenPdfInIframe(fileUrl, err) {
+    try {
+        const iframe = ensurePdfIframe();
+        if (!iframe) return false;
+
+        // تعطيل وضع PDF.js
+        __lecturesState.pdfDoc = null;
+
+        // تحديث واجهة الصفحات (مش هتشتغل مع iframe)
+        const pn = document.getElementById('pdfPageNum');
+        const pc = document.getElementById('pdfPageCount');
+        if (pn) pn.textContent = '-';
+        if (pc) pc.textContent = '-';
+        setPdfControlsEnabled(false);
+
+        const canvas = document.getElementById('pdfCanvas');
+        if (canvas) canvas.style.display = 'none';
+
+        iframe.style.display = 'block';
+        iframe.src = fileUrl;
+
+        // رسالة مفيدة بدل "مش هقدر" بدون تفاصيل
+        showAlert('تعذّر تشغيل عارض PDF داخل الموقع، فتم فتح الملف داخل عارض المتصفح.', 'info');
+        return true;
+    } catch (e) {
+        console.error(e);
+        return false;
+    }
+}
+
+
 async function openLecturePdf(fileUrl) {
     try {
         showLecturesViewerView();
+
+        // تأكد إننا في وضع PDF.js (مش iframe)
+        const __iframe = ensurePdfIframe();
+        if (__iframe) {
+            __iframe.style.display = 'none';
+            try { __iframe.src = 'about:blank'; } catch (e) {}
+        }
+        const __canvas = document.getElementById('pdfCanvas');
+        if (__canvas) __canvas.style.display = 'block';
+        setPdfControlsEnabled(true);
+
 
         const fileName = decodeURIComponent(String(fileUrl).split('/').pop() || 'file.pdf');
         const nameEl = document.getElementById('viewerFileName');
@@ -4323,8 +4451,21 @@ async function openLecturePdf(fileUrl) {
             }
         } catch (e) {}
 
-        const loadingTask = window.pdfjsLib.getDocument({ url: fileUrl });
-        const pdf = await loadingTask.promise;
+        let pdf = null;
+
+// جرّب عادي (Worker)
+try {
+    const loadingTask = window.pdfjsLib.getDocument({ url: fileUrl });
+    pdf = await loadingTask.promise;
+} catch (e) {
+    // fallback: بدون Worker (بيحل مشاكل CORS/Worker/file:// في بعض البيئات)
+    try {
+        const loadingTask2 = window.pdfjsLib.getDocument({ url: fileUrl, disableWorker: true });
+        pdf = await loadingTask2.promise;
+    } catch (e2) {
+        throw e2;
+    }
+}
 
         __lecturesState.pdfDoc = pdf;
         __lecturesState.pageCount = pdf.numPages || 1;
@@ -4340,8 +4481,12 @@ async function openLecturePdf(fileUrl) {
         await renderPdfPage(1);
     } catch (err) {
         console.error(err);
-        showAlert('مش قادر أفتح ملف الـ PDF ده.', 'error');
-        showLecturesListView();
+        const usedFallback = fallbackOpenPdfInIframe(fileUrl, err);
+        if (!usedFallback) {
+            const extra = (err && err.message) ? ` (${err.message})` : '';
+            showAlert('مش قادر أفتح ملف الـ PDF ده.' + extra, 'error');
+            showLecturesListView();
+        }
     } finally {
         const loading = document.getElementById('pdfLoading');
         if (loading) loading.style.display = 'none';
